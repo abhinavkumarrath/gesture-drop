@@ -21,11 +21,14 @@ export default function UniversalGestureDrop() {
   const [speed, setSpeed] = useState<string>("0 KB/s");
   const [isTransferring, setIsTransferring] = useState<boolean>(false);
   const [copiedMsg, setCopiedMsg] = useState<boolean>(false);
+  
+  const [isCameraActive, setIsCameraActive] = useState<boolean>(true);
 
   // Interaction
   const [handState, setHandState] = useState("Open 🖐️");
   const [file, setFile] = useState<File | null>(null);
   const [peerFistReady, setPeerFistReady] = useState(false);
+  const [localFistReady, setLocalFistReady] = useState(false); // NEW: For Push-Throwing
   
   // Refs
   const fileRef = useRef<File | null>(null);
@@ -43,14 +46,9 @@ export default function UniversalGestureDrop() {
   const transferStartRef = useRef<number>(0);
   const bytesTransferredRef = useRef<number>(0);
 
-  // Reassembly buffer for incoming chunks
   const incomingFileRef = useRef<{
-    name: string;
-    size: number;
-    mimeType: string;
-    totalChunks: number;
-    chunks: ArrayBuffer[];
-    count: number;
+    name: string; size: number; mimeType: string;
+    totalChunks: number; chunks: ArrayBuffer[]; count: number;
   } | null>(null);
 
   useEffect(() => { fileRef.current = file; }, [file]);
@@ -58,7 +56,6 @@ export default function UniversalGestureDrop() {
   useEffect(() => { isTransferringRef.current = isTransferring; }, [isTransferring]);
   useEffect(() => { setIsMounted(true); }, []);
 
-  // Check URL params for auto-join
   useEffect(() => {
     if (!isMounted) return;
     const params = new URLSearchParams(window.location.search);
@@ -66,19 +63,21 @@ export default function UniversalGestureDrop() {
     if (joinId) setRemoteIdInput(joinId);
   }, [isMounted]);
 
-  // Render QR Code
+  useEffect(() => {
+    const handleFocus = () => setTimeout(() => setIsCameraActive(true), 500);
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, []);
+
   useEffect(() => {
     if (mode === "host" && myPeerId && qrCanvasRef.current) {
       const joinUrl = `${window.location.origin}/?join=${myPeerId}`;
       QRCode.toCanvas(qrCanvasRef.current, joinUrl, {
         width: 180, margin: 2, color: { dark: "#6366f1", light: "#0f172a" },
-      }, (err) => {
-        if (err) console.error("QR render error", err);
-      });
+      }, (err) => { if (err) console.error("QR render error", err); });
     }
   }, [mode, myPeerId]);
 
-  // 1. Initialize MediaPipe Vision
   useEffect(() => {
     if (!isMounted) return;
     const initMediaPipe = async () => {
@@ -91,20 +90,16 @@ export default function UniversalGestureDrop() {
             modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
             delegate: "GPU",
           },
-          runningMode: "VIDEO",
-          numHands: 1,
+          runningMode: "VIDEO", numHands: 1,
         });
         setLandmarker(handLandmarker);
-      } catch (err) {
-        console.error("Failed to load MediaPipe WASM", err);
-      }
+      } catch (err) { console.error("Failed to load MediaPipe WASM", err); }
     };
     initMediaPipe();
   }, [isMounted]);
 
-  // 2. Handle Webcam 
   useEffect(() => {
-    if (!landmarker || mode === "menu") return;
+    if (!landmarker || mode === "menu" || !isCameraActive) return;
 
     let mediaStream: MediaStream | null = null;
     let animationFrameId: number;
@@ -158,7 +153,7 @@ export default function UniversalGestureDrop() {
       if (animationFrameId) cancelAnimationFrame(animationFrameId);
       if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
     };
-  }, [landmarker, mode]);
+  }, [landmarker, mode, isCameraActive]);
 
   const updateSpeedTelemetry = (bytesDelta: number) => {
     const now = performance.now();
@@ -174,14 +169,13 @@ export default function UniversalGestureDrop() {
     }
   };
 
-  // HARD RESET for Cancels
   const handleCancel = () => {
     cancelTransferRef.current = true;
     if (conn) conn.send({ type: "CANCEL" });
     
     incomingFileRef.current = null;
     setIsTransferring(false);
-    setProgress(0); // Immediately hide progress bar
+    setProgress(0);
     setSpeed("0 KB/s");
     setFile(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -196,83 +190,83 @@ export default function UniversalGestureDrop() {
     setTimeout(() => setCopiedMsg(false), 3000);
   };
 
-  // 3. Chunk-aware Connection Setup
+  // EXTRACTED: Unified Sending Logic for Push & Pull
+  const executeTransfer = async (connection: DataConnection) => {
+    if (!fileRef.current || isTransferringRef.current) return;
+    
+    const currentFile = fileRef.current;
+    const CHUNK_SIZE = 64 * 1024; 
+    const totalChunks = Math.ceil(currentFile.size / CHUNK_SIZE);
+    
+    connection.send({
+      type: "FILE_START", name: currentFile.name, size: currentFile.size,
+      mimeType: currentFile.type || "application/octet-stream", totalChunks,
+    });
+
+    const dc = (connection as any).dataChannel;
+    setIsTransferring(true);
+    setProgress(0);
+    cancelTransferRef.current = false;
+    transferStartRef.current = performance.now();
+    bytesTransferredRef.current = 0;
+
+    for (let i = 0; i < totalChunks; i++) {
+      if (cancelTransferRef.current) break; 
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, currentFile.size);
+      const slice = currentFile.slice(start, end);
+      const buffer = await slice.arrayBuffer();
+
+      while (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+        await new Promise((r) => setTimeout(r, 1));
+      }
+
+      connection.send({ type: "CHUNK", index: i, buffer });
+      updateSpeedTelemetry(buffer.byteLength);
+
+      const updateInterval = Math.max(1, Math.floor(totalChunks / 20));
+      if (i % updateInterval === 0 || i === totalChunks - 1) {
+        const pct = Math.round(((i + 1) / totalChunks) * 100);
+        setProgress(pct);
+        setLocalStatus(`Sending ${pct}%...`);
+      }
+    }
+
+    if (!cancelTransferRef.current) {
+      connection.send({ type: "FILE_END" });
+      setLocalStatus("File Sent! 🎉");
+    }
+
+    setIsTransferring(false);
+    setSpeed("0 KB/s");
+    fileRef.current = null; 
+    setFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    
+    setTimeout(() => {
+      setProgress(0);
+      setLocalStatus("Connected Peer-to-Peer 🚀");
+    }, 3000);
+  };
+
   const setupConnection = (connection: DataConnection) => {
     setConn(connection);
     setLocalStatus("Connected Peer-to-Peer 🚀");
     
     connection.on("data", async (data: any) => {
       if (data === "DROP_REQUEST") {
-        if (fileRef.current && handRef.current.includes("Grabbed")) {
-          const CHUNK_SIZE = 64 * 1024; 
-          const totalChunks = Math.ceil(fileRef.current.size / CHUNK_SIZE);
-          
-          connection.send({
-            type: "FILE_START",
-            name: fileRef.current.name,
-            size: fileRef.current.size,
-            mimeType: fileRef.current.type || "application/octet-stream",
-            totalChunks,
-          });
-
-          const dc = (connection as any).dataChannel;
-          setIsTransferring(true);
-          setProgress(0);
-          cancelTransferRef.current = false;
-          transferStartRef.current = performance.now();
-          bytesTransferredRef.current = 0;
-
-          for (let i = 0; i < totalChunks; i++) {
-            if (cancelTransferRef.current) {
-              break; // Hard abort loop
-            }
-
-            const start = i * CHUNK_SIZE;
-            const end = Math.min(start + CHUNK_SIZE, fileRef.current.size);
-            const slice = fileRef.current.slice(start, end);
-            const buffer = await slice.arrayBuffer();
-
-            // SPEED WORKAROUND: 4MB Goldilocks Zone + 1ms yield
-            while (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
-              await new Promise((r) => setTimeout(r, 1));
-            }
-
-            connection.send({ type: "CHUNK", index: i, buffer });
-            updateSpeedTelemetry(buffer.byteLength);
-
-            const updateInterval = Math.max(1, Math.floor(totalChunks / 20));
-            if (i % updateInterval === 0 || i === totalChunks - 1) {
-              const pct = Math.round(((i + 1) / totalChunks) * 100);
-              setProgress(pct);
-              setLocalStatus(`Sending ${pct}%...`);
-            }
-          }
-
-          if (!cancelTransferRef.current) {
-            connection.send({ type: "FILE_END" });
-            setLocalStatus("File Sent! 🎉");
-          }
-
-          // HARD RESET FOR SENDER COMPLETION
-          setIsTransferring(false);
-          setSpeed("0 KB/s");
-          fileRef.current = null; 
-          setFile(null);
-          if (fileInputRef.current) fileInputRef.current.value = "";
-          
-          setTimeout(() => {
-            setProgress(0); // Closes the UI panel
-            setLocalStatus("Connected Peer-to-Peer 🚀");
-          }, 3000);
+        // FIX: Replaced strict handRef check with simple file check.
+        // If they ask for the file, and we have it, just send it! No strict posture demands.
+        if (fileRef.current) {
+          executeTransfer(connection);
         }
       } else if (data.type === "STATUS") {
         setPeerStatus(data.message);
       } else if (data.type === "CANCEL") {
-        // HARD RESET ON RECEIVING CANCEL SIGNAL
         cancelTransferRef.current = true; 
         incomingFileRef.current = null;
         setIsTransferring(false);
-        setProgress(0); // Closes UI
+        setProgress(0);
         setSpeed("0 KB/s");
         setFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
@@ -314,7 +308,6 @@ export default function UniversalGestureDrop() {
           document.body.appendChild(a); a.click(); document.body.removeChild(a);
           URL.revokeObjectURL(url);
           
-          // HARD RESET FOR RECEIVER COMPLETION
           incomingFileRef.current = null;
           setIsTransferring(false);
           setSpeed("0 KB/s");
@@ -322,7 +315,7 @@ export default function UniversalGestureDrop() {
           setLocalStatus("File Received & Downloaded! 🎉");
           
           setTimeout(() => { 
-            setProgress(0); // Closes UI
+            setProgress(0); 
             setLocalStatus("Connected Peer-to-Peer 🚀"); 
           }, 3000);
         }
@@ -374,6 +367,7 @@ export default function UniversalGestureDrop() {
   useEffect(() => {
     if (!conn) return;
 
+    // 1. Broadcaster Status
     if (file && handState.includes("Grabbed")) {
       if (lastSentStatus.current !== "GRABBED") {
         conn.send({ type: "STATUS", message: "Peer is holding a file!" });
@@ -386,6 +380,7 @@ export default function UniversalGestureDrop() {
       }
     }
 
+    // 2. PULL LOGIC (Receiver catches file)
     if (peerStatus.includes("holding a file")) {
       if (handState.includes("Grabbed")) {
         setPeerFistReady(true);
@@ -394,15 +389,30 @@ export default function UniversalGestureDrop() {
         setPeerFistReady(false);
         setLocalStatus("Pulling file...");
       }
+    } else {
+      if (peerFistReady) setPeerFistReady(false);
     }
-  }, [handState, conn, file, peerStatus, peerFistReady]);
+
+    // 3. PUSH LOGIC (Sender throws file) - NEW!
+    if (file) {
+      if (handState.includes("Grabbed")) {
+        setLocalFistReady(true);
+      } else if (handState.includes("Open") && localFistReady) {
+        setLocalFistReady(false);
+        setLocalStatus("Throwing file...");
+        executeTransfer(conn); // Start pushing immediately!
+      }
+    } else {
+      if (localFistReady) setLocalFistReady(false);
+    }
+
+  }, [handState, conn, file, peerStatus, peerFistReady, localFistReady]);
 
   if (!isMounted) return <div className="min-h-screen bg-slate-950" />;
 
   return (
     <div className="flex flex-col items-center justify-start min-h-screen bg-slate-950 text-white p-4 md:p-8 gap-6 overflow-y-auto">
       
-      {/* THE FLOATING TOAST POPUP */}
       {copiedMsg && (
         <div className="fixed top-10 left-1/2 transform -translate-x-1/2 bg-emerald-600 text-white px-6 py-3 rounded-full shadow-2xl shadow-emerald-900/50 font-bold text-sm z-50 flex items-center gap-2 transition-all">
           ✅ Link copied to clipboard!
@@ -431,7 +441,6 @@ export default function UniversalGestureDrop() {
         </div>
       ) : (
         <>
-          {/* Active Session UI */}
           <div className="w-full max-w-2xl bg-slate-900/95 backdrop-blur border border-slate-800 rounded-3xl p-6 shadow-2xl flex flex-col gap-4">
             <div className="flex justify-between items-center">
               <h2 className="text-lg font-bold flex items-center gap-2">
@@ -448,10 +457,7 @@ export default function UniversalGestureDrop() {
                 <div className="flex flex-col gap-2 text-xs font-mono">
                   <span className="text-slate-400">Scan QR to connect peer:</span>
                   <span className="text-indigo-400 select-all font-bold break-all">{myPeerId || "Generating..."}</span>
-                  <button 
-                    onClick={handleCopyLink} 
-                    className="mt-1 bg-slate-800 hover:bg-slate-700 text-slate-200 py-1.5 px-3 rounded-lg text-xs w-fit transition"
-                  >
+                  <button onClick={handleCopyLink} className="mt-1 bg-slate-800 hover:bg-slate-700 text-slate-200 py-1.5 px-3 rounded-lg text-xs w-fit transition">
                     Copy Link
                   </button>
                 </div>
@@ -461,7 +467,16 @@ export default function UniversalGestureDrop() {
               </div>
             )}
 
-            <input type="file" ref={fileInputRef} onChange={(e) => setFile(e.target.files?.[0] || null)} className="w-full text-xs text-slate-400 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer" />
+            <input 
+              type="file" 
+              ref={fileInputRef} 
+              onClick={() => setIsCameraActive(false)}
+              onChange={(e) => {
+                setFile(e.target.files?.[0] || null);
+                setIsCameraActive(true);
+              }} 
+              className="w-full text-xs text-slate-400 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer" 
+            />
 
             {(isTransferring || progress > 0) && (
               <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex flex-col gap-2">
@@ -492,10 +507,17 @@ export default function UniversalGestureDrop() {
             </h1>
             
             <div className="relative w-full aspect-[4/3] max-w-[480px] rounded-3xl overflow-hidden border-4 border-slate-800 shadow-2xl bg-black">
-              <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover transition ${isTransferring ? 'opacity-50 grayscale' : ''}`} style={{ transform: "scaleX(-1)" }} />
+              <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover transition ${isTransferring || !isCameraActive ? 'opacity-50 grayscale' : ''}`} style={{ transform: "scaleX(-1)" }} />
+              
               {isTransferring && (
                 <div className="absolute inset-0 flex items-center justify-center">
                   <span className="bg-slate-900/80 text-white px-4 py-2 rounded-xl text-sm font-bold shadow-lg">Camera Paused for Max Speed ⚡</span>
+                </div>
+              )}
+              
+              {(!isCameraActive && !isTransferring) && (
+                <div className="absolute inset-0 flex items-center justify-center text-center p-4">
+                  <span className="bg-slate-900/80 text-white px-4 py-2 rounded-xl text-sm font-bold shadow-lg">Camera freed for OS File Picker 📷</span>
                 </div>
               )}
             </div>
