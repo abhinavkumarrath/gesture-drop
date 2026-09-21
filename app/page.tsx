@@ -174,20 +174,22 @@ export default function UniversalGestureDrop() {
     }
   };
 
+  // HARD RESET for Cancels
   const handleCancel = () => {
     cancelTransferRef.current = true;
     if (conn) conn.send({ type: "CANCEL" });
     
-    if (incomingFileRef.current) {
-      incomingFileRef.current = null;
-      setIsTransferring(false);
-      setProgress(0);
-      setSpeed("0 KB/s");
-      setLocalStatus("Transfer Cancelled");
-    }
+    incomingFileRef.current = null;
+    setIsTransferring(false);
+    setProgress(0); // Immediately hide progress bar
+    setSpeed("0 KB/s");
+    setFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    
+    setLocalStatus("Transfer Cancelled");
+    setTimeout(() => setLocalStatus("Connected Peer-to-Peer 🚀"), 3000);
   };
 
-  // Triggers the Floating Toast
   const handleCopyLink = () => {
     navigator.clipboard.writeText(`${window.location.origin}/?join=${myPeerId}`);
     setCopiedMsg(true);
@@ -222,8 +224,7 @@ export default function UniversalGestureDrop() {
 
           for (let i = 0; i < totalChunks; i++) {
             if (cancelTransferRef.current) {
-              setLocalStatus("Transfer Cancelled");
-              break; 
+              break; // Hard abort loop
             }
 
             const start = i * CHUNK_SIZE;
@@ -231,8 +232,9 @@ export default function UniversalGestureDrop() {
             const slice = fileRef.current.slice(start, end);
             const buffer = await slice.arrayBuffer();
 
-            while (dc && dc.bufferedAmount > 1 * 1024 * 1024) {
-              await new Promise((r) => setTimeout(r, 5));
+            // SPEED WORKAROUND: 4MB Goldilocks Zone + 1ms yield
+            while (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+              await new Promise((r) => setTimeout(r, 1));
             }
 
             connection.send({ type: "CHUNK", index: i, buffer });
@@ -251,21 +253,30 @@ export default function UniversalGestureDrop() {
             setLocalStatus("File Sent! 🎉");
           }
 
+          // HARD RESET FOR SENDER COMPLETION
           setIsTransferring(false);
           setSpeed("0 KB/s");
           fileRef.current = null; 
           setFile(null);
           if (fileInputRef.current) fileInputRef.current.value = "";
-          setTimeout(() => setLocalStatus("Connected Peer-to-Peer 🚀"), 2000);
+          
+          setTimeout(() => {
+            setProgress(0); // Closes the UI panel
+            setLocalStatus("Connected Peer-to-Peer 🚀");
+          }, 3000);
         }
       } else if (data.type === "STATUS") {
         setPeerStatus(data.message);
       } else if (data.type === "CANCEL") {
+        // HARD RESET ON RECEIVING CANCEL SIGNAL
         cancelTransferRef.current = true; 
         incomingFileRef.current = null;
         setIsTransferring(false);
-        setProgress(0);
+        setProgress(0); // Closes UI
         setSpeed("0 KB/s");
+        setFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        
         setLocalStatus("Transfer Cancelled by Peer");
         setTimeout(() => setLocalStatus("Connected Peer-to-Peer 🚀"), 3000);
       } else if (data.type === "FILE_START") {
@@ -281,7 +292,7 @@ export default function UniversalGestureDrop() {
         setLocalStatus(`Receiving 0%...`);
       } else if (data.type === "CHUNK") {
         const inc = incomingFileRef.current;
-        if (inc) {
+        if (inc && !cancelTransferRef.current) {
           inc.chunks[data.index] = data.buffer;
           inc.count++;
           updateSpeedTelemetry(data.buffer.byteLength);
@@ -295,7 +306,7 @@ export default function UniversalGestureDrop() {
         }
       } else if (data.type === "FILE_END") {
         const inc = incomingFileRef.current;
-        if (inc) {
+        if (inc && !cancelTransferRef.current) {
           const blob = new Blob(inc.chunks, { type: inc.mimeType });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
@@ -303,12 +314,17 @@ export default function UniversalGestureDrop() {
           document.body.appendChild(a); a.click(); document.body.removeChild(a);
           URL.revokeObjectURL(url);
           
+          // HARD RESET FOR RECEIVER COMPLETION
           incomingFileRef.current = null;
           setIsTransferring(false);
           setSpeed("0 KB/s");
           setProgress(100);
           setLocalStatus("File Received & Downloaded! 🎉");
-          setTimeout(() => { setProgress(0); setLocalStatus("Connected Peer-to-Peer 🚀"); }, 3000);
+          
+          setTimeout(() => { 
+            setProgress(0); // Closes UI
+            setLocalStatus("Connected Peer-to-Peer 🚀"); 
+          }, 3000);
         }
       }
     });
@@ -317,6 +333,7 @@ export default function UniversalGestureDrop() {
       setLocalStatus("Peer Disconnected");
       setConn(null);
       setIsTransferring(false);
+      setProgress(0);
     });
   };
 
@@ -385,7 +402,7 @@ export default function UniversalGestureDrop() {
   return (
     <div className="flex flex-col items-center justify-start min-h-screen bg-slate-950 text-white p-4 md:p-8 gap-6 overflow-y-auto">
       
-      {/* 🚀 THE FLOATING TOAST POPUP */}
+      {/* THE FLOATING TOAST POPUP */}
       {copiedMsg && (
         <div className="fixed top-10 left-1/2 transform -translate-x-1/2 bg-emerald-600 text-white px-6 py-3 rounded-full shadow-2xl shadow-emerald-900/50 font-bold text-sm z-50 flex items-center gap-2 transition-all">
           ✅ Link copied to clipboard!
