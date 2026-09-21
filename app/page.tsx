@@ -36,10 +36,9 @@ export default function UniversalGestureDrop() {
   const [landmarker, setLandmarker] = useState<HandLandmarker | null>(null);
   const peerInstance = useRef<Peer | null>(null);
 
-  // 🚀 SPEED OPTIMIZATION: Ref to synchronously pause the AI vision during transfer
+  // Speed & Control Refs
   const isTransferringRef = useRef<boolean>(false);
-  
-  // Speed & Progress tracking refs
+  const cancelTransferRef = useRef<boolean>(false);
   const transferStartRef = useRef<number>(0);
   const bytesTransferredRef = useRef<number>(0);
 
@@ -55,9 +54,7 @@ export default function UniversalGestureDrop() {
 
   useEffect(() => { fileRef.current = file; }, [file]);
   useEffect(() => { handRef.current = handState; }, [handState]);
-  useEffect(() => { 
-    isTransferringRef.current = isTransferring; 
-  }, [isTransferring]);
+  useEffect(() => { isTransferringRef.current = isTransferring; }, [isTransferring]);
   useEffect(() => { setIsMounted(true); }, []);
 
   // Check URL params for auto-join
@@ -73,9 +70,7 @@ export default function UniversalGestureDrop() {
     if (mode === "host" && myPeerId && qrCanvasRef.current) {
       const joinUrl = `${window.location.origin}/?join=${myPeerId}`;
       QRCode.toCanvas(qrCanvasRef.current, joinUrl, {
-        width: 180,
-        margin: 2,
-        color: { dark: "#6366f1", light: "#0f172a" },
+        width: 180, margin: 2, color: { dark: "#6366f1", light: "#0f172a" },
       }, (err) => {
         if (err) console.error("QR render error", err);
       });
@@ -133,7 +128,6 @@ export default function UniversalGestureDrop() {
     const FRAME_THRESHOLD = 5;
 
     const predictWebcam = async () => {
-      // 🚀 SPEED OPTIMIZATION: Pause heavy AI calculations if network is transferring
       if (isTransferringRef.current) {
         animationFrameId = requestAnimationFrame(predictWebcam);
         return;
@@ -165,18 +159,31 @@ export default function UniversalGestureDrop() {
     };
   }, [landmarker, mode]);
 
-  // Telemetry Helper
   const updateSpeedTelemetry = (bytesDelta: number) => {
     const now = performance.now();
     bytesTransferredRef.current += bytesDelta;
     const elapsedSec = (now - transferStartRef.current) / 1000;
-    if (elapsedSec > 0.05) {
+    if (elapsedSec > 0.1) { 
       const bytesPerSec = bytesTransferredRef.current / elapsedSec;
       if (bytesPerSec > 1024 * 1024) {
         setSpeed(`${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`);
       } else {
         setSpeed(`${(bytesPerSec / 1024).toFixed(1)} KB/s`);
       }
+    }
+  };
+
+  const handleCancel = () => {
+    cancelTransferRef.current = true;
+    if (conn) conn.send({ type: "CANCEL" });
+    
+    // Reset local receiver state if we were receiving
+    if (incomingFileRef.current) {
+      incomingFileRef.current = null;
+      setIsTransferring(false);
+      setProgress(0);
+      setSpeed("0 KB/s");
+      setLocalStatus("Transfer Cancelled");
     }
   };
 
@@ -188,8 +195,7 @@ export default function UniversalGestureDrop() {
     connection.on("data", async (data: any) => {
       if (data === "DROP_REQUEST") {
         if (fileRef.current && handRef.current.includes("Grabbed")) {
-          // 🚀 SPEED OPTIMIZATION: WebRTC SCTP maximum optimal payload is ~64KB. 
-          const CHUNK_SIZE = 64 * 1024; 
+          const CHUNK_SIZE = 64 * 1024; // SCTP Optimal
           const totalChunks = Math.ceil(fileRef.current.size / CHUNK_SIZE);
           
           connection.send({
@@ -203,35 +209,45 @@ export default function UniversalGestureDrop() {
           const dc = (connection as any).dataChannel;
           setIsTransferring(true);
           setProgress(0);
+          cancelTransferRef.current = false;
           transferStartRef.current = performance.now();
           bytesTransferredRef.current = 0;
 
           for (let i = 0; i < totalChunks; i++) {
+            if (cancelTransferRef.current) {
+              setLocalStatus("Transfer Cancelled");
+              break; // Abort sending loop
+            }
+
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, fileRef.current.size);
             const slice = fileRef.current.slice(start, end);
             const buffer = await slice.arrayBuffer();
 
-            // WebRTC Buffer limit
+            // Aggressive buffering to keep CPU free
             while (dc && dc.bufferedAmount > 8 * 1024 * 1024) {
-              await new Promise((r) => setTimeout(r, 1));
+              await new Promise((r) => setTimeout(r, 2));
             }
 
             connection.send({ type: "CHUNK", index: i, buffer });
             updateSpeedTelemetry(buffer.byteLength);
 
-            // Throttle UI to every 100 chunks to free up main thread
-            if (i % 100 === 0 || i === totalChunks - 1) {
+            // Extreme UI Throttling for max speed (update only 10 times total)
+            const updateInterval = Math.max(1, Math.floor(totalChunks / 10));
+            if (i % updateInterval === 0 || i === totalChunks - 1) {
               const pct = Math.round(((i + 1) / totalChunks) * 100);
               setProgress(pct);
               setLocalStatus(`Sending ${pct}%...`);
             }
           }
 
-          connection.send({ type: "FILE_END" });
+          if (!cancelTransferRef.current) {
+            connection.send({ type: "FILE_END" });
+            setLocalStatus("File Sent! 🎉");
+          }
+
           setIsTransferring(false);
           setSpeed("0 KB/s");
-          
           fileRef.current = null; 
           setFile(null);
           if (fileInputRef.current) fileInputRef.current.value = "";
@@ -239,14 +255,19 @@ export default function UniversalGestureDrop() {
         }
       } else if (data.type === "STATUS") {
         setPeerStatus(data.message);
+      } else if (data.type === "CANCEL") {
+        cancelTransferRef.current = true; // Signal sender loop to abort
+        incomingFileRef.current = null;
+        setIsTransferring(false);
+        setProgress(0);
+        setSpeed("0 KB/s");
+        setLocalStatus("Transfer Cancelled by Peer");
+        setTimeout(() => setLocalStatus("Connected Peer-to-Peer 🚀"), 3000);
       } else if (data.type === "FILE_START") {
+        cancelTransferRef.current = false;
         incomingFileRef.current = {
-          name: data.name,
-          size: data.size,
-          mimeType: data.mimeType,
-          totalChunks: data.totalChunks,
-          chunks: new Array(data.totalChunks),
-          count: 0,
+          name: data.name, size: data.size, mimeType: data.mimeType,
+          totalChunks: data.totalChunks, chunks: new Array(data.totalChunks), count: 0,
         };
         setIsTransferring(true);
         setProgress(0);
@@ -260,7 +281,8 @@ export default function UniversalGestureDrop() {
           inc.count++;
           updateSpeedTelemetry(data.buffer.byteLength);
           
-          if (inc.count % 100 === 0 || inc.count === inc.totalChunks) {
+          const updateInterval = Math.max(1, Math.floor(inc.totalChunks / 10));
+          if (inc.count % updateInterval === 0 || inc.count === inc.totalChunks) {
             const pct = Math.round((inc.count / inc.totalChunks) * 100);
             setProgress(pct);
             setLocalStatus(`Receiving ${pct}%...`);
@@ -272,11 +294,8 @@ export default function UniversalGestureDrop() {
           const blob = new Blob(inc.chunks, { type: inc.mimeType });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
-          a.href = url;
-          a.download = inc.name;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          a.href = url; a.download = inc.name;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
           URL.revokeObjectURL(url);
           
           incomingFileRef.current = null;
@@ -284,10 +303,7 @@ export default function UniversalGestureDrop() {
           setSpeed("0 KB/s");
           setProgress(100);
           setLocalStatus("File Received & Downloaded! 🎉");
-          setTimeout(() => {
-            setProgress(0);
-            setLocalStatus("Connected Peer-to-Peer 🚀");
-          }, 3000);
+          setTimeout(() => { setProgress(0); setLocalStatus("Connected Peer-to-Peer 🚀"); }, 3000);
         }
       }
     });
@@ -424,6 +440,11 @@ export default function UniversalGestureDrop() {
             <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
               <div className="bg-indigo-500 h-2.5 rounded-full transition-all duration-150 ease-out" style={{ width: `${progress}%` }} />
             </div>
+            {isTransferring && (
+              <button onClick={handleCancel} className="mt-2 bg-rose-600 hover:bg-rose-500 text-white font-bold py-1.5 px-4 rounded-xl text-xs transition w-full shadow-lg shadow-rose-900/50">
+                Cancel Transfer
+              </button>
+            )}
           </div>
         )}
         
