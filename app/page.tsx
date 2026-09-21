@@ -71,14 +71,14 @@ export default function UniversalGestureDrop() {
       QRCode.toCanvas(qrCanvasRef.current, joinUrl, {
         width: 180,
         margin: 2,
-        color: { dark: "#6366f1", light: "#0f172a" }, // Indigo to match UI
+        color: { dark: "#6366f1", light: "#0f172a" },
       }, (err) => {
         if (err) console.error("QR render error", err);
       });
     }
   }, [mode, myPeerId]);
 
-  // 1. Initialize MediaPipe Vision (Client-side only)
+  // 1. Initialize MediaPipe Vision
   useEffect(() => {
     if (!isMounted) return;
     const initMediaPipe = async () => {
@@ -149,7 +149,6 @@ export default function UniversalGestureDrop() {
       animationFrameId = requestAnimationFrame(predictWebcam);
     };
 
-    // Cleanup function: stop camera and cancel animation loop on unmount/mode change
     return () => {
       if (animationFrameId) cancelAnimationFrame(animationFrameId);
       if (mediaStream) {
@@ -181,7 +180,8 @@ export default function UniversalGestureDrop() {
     connection.on("data", async (data: any) => {
       if (data === "DROP_REQUEST") {
         if (fileRef.current && handRef.current.includes("Grabbed")) {
-          const CHUNK_SIZE = 64 * 1024; // 64KB slices
+          // TURBOCHARGED CHUNKING
+          const CHUNK_SIZE = 256 * 1024; // 256KB slices
           const totalChunks = Math.ceil(fileRef.current.size / CHUNK_SIZE);
           
           connection.send({
@@ -204,24 +204,26 @@ export default function UniversalGestureDrop() {
             const slice = fileRef.current.slice(start, end);
             const buffer = await slice.arrayBuffer();
 
-            // Backpressure pause prevents OOM browser crashes
-            while (dc && dc.bufferedAmount > 8 * 1024 * 1024) {
-              await new Promise((r) => setTimeout(r, 20));
+            // Expanded 16MB backpressure buffer with 1ms yield to maximize throughput
+            while (dc && dc.bufferedAmount > 16 * 1024 * 1024) {
+              await new Promise((r) => setTimeout(r, 1));
             }
 
             connection.send({ type: "CHUNK", index: i, buffer });
             updateSpeedTelemetry(buffer.byteLength);
 
-            const pct = Math.round(((i + 1) / totalChunks) * 100);
-            setProgress(pct);
-            setLocalStatus(`Sending ${pct}% (${fileRef.current.name})...`);
+            // Throttle React UI updates to every 50 chunks to prevent main thread lag
+            if (i % 50 === 0 || i === totalChunks - 1) {
+              const pct = Math.round(((i + 1) / totalChunks) * 100);
+              setProgress(pct);
+              setLocalStatus(`Sending ${pct}% (${fileRef.current.name})...`);
+            }
           }
 
           connection.send({ type: "FILE_END" });
           setIsTransferring(false);
           setSpeed("0 KB/s");
           
-          // Anti-loop fix: instantly clear the file state
           fileRef.current = null; 
           setFile(null);
           if (fileInputRef.current) fileInputRef.current.value = "";
@@ -249,9 +251,13 @@ export default function UniversalGestureDrop() {
           inc.chunks[data.index] = data.buffer;
           inc.count++;
           updateSpeedTelemetry(data.buffer.byteLength);
-          const pct = Math.round((inc.count / inc.totalChunks) * 100);
-          setProgress(pct);
-          setLocalStatus(`Receiving ${pct}% (${inc.name})...`);
+          
+          // Throttle receiving UI updates identically
+          if (inc.count % 50 === 0 || inc.count === inc.totalChunks) {
+            const pct = Math.round((inc.count / inc.totalChunks) * 100);
+            setProgress(pct);
+            setLocalStatus(`Receiving ${pct}% (${inc.name})...`);
+          }
         }
       } else if (data.type === "FILE_END") {
         const inc = incomingFileRef.current;
@@ -318,7 +324,6 @@ export default function UniversalGestureDrop() {
     });
   };
 
-  // Cleanup WebRTC connection on unmount
   useEffect(() => {
     return () => {
       if (peerInstance.current) peerInstance.current.destroy();
